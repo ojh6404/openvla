@@ -1,8 +1,10 @@
 """
-finetune.py
+finetune_soft_target.py
 
-Simple script for parameter-efficient fine-tuning of OpenVLA models loaded through the HuggingFace AutoClasses, using
-HuggingFace PEFT library for low-rank adaptation (LoRA).
+Parameter-efficient fine-tuning of OpenVLA models with soft target loss.
+Instead of hard cross-entropy loss (only correct bin gets weight 1), we use a
+Gaussian soft target distribution centered on the correct bin, allowing the model
+to learn that nearby bins represent similar actions.
 
 Notes & Benchmarks:
     - Requires PEFT (`pip install peft==0.11.1`)
@@ -11,11 +13,12 @@ Notes & Benchmarks:
         + One 80 GB GPU can fit a Batch Size of 24
 
 Run with:
-    - [Single Node Multi-GPU (= $K) ]: torchrun --standalone --nnodes 1 --nproc-per-node $K vla-scripts/finetune.py
-    - [Override Config Values]: torchrun --standalone --nnodes 1 --nproc-per-node $K vla-scripts/finetune.py \
+    - [Single Node Multi-GPU (= $K) ]: torchrun --standalone --nnodes 1 --nproc-per-node $K vla-scripts/finetune_soft_target.py
+    - [Override Config Values]: torchrun --standalone --nnodes 1 --nproc-per-node $K vla-scripts/finetune_soft_target.py \
                                     --data_root_dir <PATH/TO/RLDS/DATASETS/DIRECTORY> \
                                     --dataset_name <DATASET_NAME> \
                                     --run_root_dir <PATH/TO/LOGS/DIR> \
+                                    --soft_target_sigma 2.0 \
                                     ...
 """
 
@@ -27,6 +30,7 @@ from typing import Optional
 
 import draccus
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 import tqdm
 from accelerate import PartialState
@@ -53,23 +57,148 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-# # === Utilities ===
-# # fmt: off
-# def create_vision_transform(vla: nn.Module, input_size: int) -> Callable[[Image.Image], torch.Tensor]:
-#     """Gets image transform for the vision encoder."""
-#     data_cfg = timm.data.resolve_model_data_config(vla.vision_backbone)
-#     data_cfg["input_size"] = (3, input_size, input_size)
-#     return timm.data.create_transform(
-#         input_size=data_cfg["input_size"],
-#         interpolation=data_cfg["interpolation"],
-#         mean=data_cfg["mean"],
-#         std=data_cfg["std"],
-#         crop_pct=1.0,           # Set to 1.0 to disable cropping
-#         crop_mode="center",     # Default crop mode --> no-op when `crop_pct == 1.0`
-#         is_training=False,      # Disable image_aug when loading transform; handled by RLDS dataloader
-#     )
-#
-# # fmt: on
+def create_gaussian_soft_target(
+    target_indices: torch.Tensor,
+    num_classes: int,
+    sigma: float = 2.0,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """
+    Create Gaussian soft target distribution centered on the target index.
+
+    Args:
+        target_indices: Shape [N] - indices of target classes (action token indices within action vocab)
+        num_classes: Total number of action bins (e.g., 256)
+        sigma: Standard deviation of Gaussian (in bin units)
+        device: Device to create tensor on
+
+    Returns:
+        Soft target distribution of shape [N, num_classes]
+    """
+    if device is None:
+        device = target_indices.device
+
+    N = target_indices.shape[0]
+
+    # Create bin indices [0, 1, ..., num_classes-1]
+    bin_indices = torch.arange(num_classes, device=device, dtype=torch.float32)  # [num_classes]
+
+    # Expand for broadcasting: target_indices [N, 1], bin_indices [1, num_classes]
+    target_indices = target_indices.float().unsqueeze(1)  # [N, 1]
+    bin_indices = bin_indices.unsqueeze(0)  # [1, num_classes]
+
+    # Compute Gaussian weights: exp(-0.5 * ((bin - target) / sigma)^2)
+    distances = (bin_indices - target_indices) / sigma  # [N, num_classes]
+    soft_targets = torch.exp(-0.5 * distances ** 2)  # [N, num_classes]
+
+    # Normalize to create probability distribution
+    soft_targets = soft_targets / soft_targets.sum(dim=1, keepdim=True)
+
+    return soft_targets
+
+
+def soft_cross_entropy_loss(
+    logits: torch.Tensor,
+    soft_targets: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Compute soft cross-entropy loss (KL divergence with soft targets).
+
+    Args:
+        logits: Raw logits of shape [N, num_classes]
+        soft_targets: Soft target distribution of shape [N, num_classes]
+        reduction: 'mean', 'sum', or 'none'
+
+    Returns:
+        Soft cross-entropy loss
+    """
+    # Compute log softmax of logits
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Cross-entropy with soft targets: -sum(p * log(q))
+    loss = -torch.sum(soft_targets * log_probs, dim=-1)
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    else:
+        return loss
+
+
+def compute_soft_target_action_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    action_token_begin_idx: int,
+    vocab_size: int,
+    num_image_patches: int,
+    n_bins: int = 256,
+    sigma: float = 2.0,
+) -> tuple[torch.Tensor, int]:
+    """
+    Compute soft target loss for action tokens only.
+
+    Args:
+        logits: Model output logits [batch, seq_len, vocab_size] (includes image patches)
+        labels: Target labels [batch, text_seq_len] (-100 for ignore, no image patches)
+        action_token_begin_idx: Start index of action tokens in vocabulary
+        vocab_size: Total vocabulary size
+        num_image_patches: Number of image patch tokens to skip in logits
+        n_bins: Number of action bins
+        sigma: Gaussian sigma for soft targets
+
+    Returns:
+        Tuple of (loss, num_action_tokens)
+    """
+    # Slice logits to skip image patches and align with labels
+    # logits[:, num_patches:-1] predicts labels[:, 1:]
+    # (The last logit predicts next token after sequence, which we don't have label for)
+    text_logits = logits[:, num_image_patches:-1, :].contiguous()  # [batch, text_seq_len-1, vocab_size]
+    shift_labels = labels[:, 1:].contiguous()  # [batch, text_seq_len-1]
+
+    # Flatten
+    text_logits = text_logits.view(-1, vocab_size)  # [batch * (text_seq_len-1), vocab_size]
+    shift_labels = shift_labels.view(-1)  # [batch * (text_seq_len-1)]
+
+    # Find action token positions (labels that are action tokens, not -100)
+    action_mask = shift_labels > action_token_begin_idx
+
+    if action_mask.sum() == 0:
+        # No action tokens in this batch - return zero loss connected to computation graph
+        return (logits.sum() * 0.0), 0
+
+    # Extract action token logits and labels
+    action_logits = text_logits[action_mask]  # [num_action_tokens, vocab_size]
+    action_labels = shift_labels[action_mask]  # [num_action_tokens]
+
+    # Convert action token IDs to action bin indices (0 to n_bins-1)
+    # ActionTokenizer encodes: token_id = vocab_size - discretized (discretized is 1 to n_bins)
+    # So to get bin index: bin_idx = vocab_size - token_id - 1
+    # This means: token (vocab_size - 1) → bin 0, token (vocab_size - n_bins) → bin (n_bins - 1)
+    action_bin_indices = vocab_size - action_labels - 1
+
+    # Clamp to valid range (handles edge cases)
+    action_bin_indices = torch.clamp(action_bin_indices, 0, n_bins - 1)
+
+    # Extract only action token logits (last n_bins of vocabulary)
+    # Note: In vocabulary, token (vocab_size - n_bins) is at index -n_bins, token (vocab_size - 1) is at index -1
+    # But we want logits ordered by bin index: logit[0] = bin 0 (lowest action), logit[255] = bin 255 (highest)
+    # Since token (vocab_size - 1) corresponds to bin 0, we need to flip the order
+    action_token_logits = action_logits[:, -n_bins:].flip(dims=[-1])  # [num_action_tokens, n_bins]
+
+    # Create soft targets
+    soft_targets = create_gaussian_soft_target(
+        action_bin_indices,
+        num_classes=n_bins,
+        sigma=sigma,
+        device=action_logits.device,
+    )
+
+    # Compute soft cross-entropy loss
+    loss = soft_cross_entropy_loss(action_token_logits, soft_targets, reduction="mean")
+
+    return loss, action_mask.sum().item()
 
 
 @dataclass
@@ -95,6 +224,12 @@ class FinetuneConfig:
                                                                     #   continually overwrite the latest checkpoint
                                                                     #   (If False, saves all checkpoints)
 
+    # Soft Target Loss Parameters
+    soft_target_sigma: float = 2.0                                  # Gaussian sigma for soft targets (in bin units)
+                                                                    #   Higher = softer targets, more tolerance for nearby bins
+                                                                    #   sigma=1.0 means ~68% weight within +/- 1 bin
+                                                                    #   sigma=2.0 means ~68% weight within +/- 2 bins
+
     # Accuracy Margin Parameter
     action_accuracy_margin: int = 0                                 # Margin for action accuracy calculation (in bins)
                                                                     #   0 = strict exact match (default, same as original)
@@ -117,7 +252,7 @@ class FinetuneConfig:
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
-    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
+    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}` with Soft Target Loss (sigma={cfg.soft_target_sigma})")
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
@@ -130,6 +265,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
         f"+lr-{cfg.learning_rate}"
+        f"+soft-sigma{cfg.soft_target_sigma}"
     )
     if cfg.use_lora:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
@@ -168,6 +304,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         trust_remote_code=True,
     )
 
+    # Get vocab size for loss computation (before DDP wrapping)
+    vocab_size = vla.config.text_config.vocab_size
+
     # Device Placement =>> note that BitsAndBytes automatically handles for quantized training
     if cfg.use_quantization:
         vla = prepare_model_for_kbit_training(vla)
@@ -196,21 +335,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
-    # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
-    #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
-    #   =>> Note that our training code does not loop over epochs because the RLDS loader does this implicitly; if using
-    #       your own Dataset, make sure to add the appropriate logic to the training loop!
-    #
-    # ---
-    # from prismatic.vla.datasets import DummyDataset
-    #
-    # vla_dataset = DummyDataset(
-    #     action_tokenizer,
-    #     processor.tokenizer,
-    #     image_transform=processor.image_processor.apply_transform,
-    #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    # )
-    # ---
+    # Get number of image patches for loss computation (after DDP wrapping)
+    num_image_patches = vla.module.vision_backbone.featurizer.patch_embed.num_patches
+
+    # Load Fine-tuning Dataset
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
         processor.tokenizer,
@@ -257,13 +385,24 @@ def finetune(cfg: FinetuneConfig) -> None:
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
             with torch.autocast("cuda", dtype=torch.bfloat16):
+                # Forward pass (don't use output.loss, compute custom soft target loss)
                 output: CausalLMOutputWithPast = vla(
                     input_ids=batch["input_ids"].to(device_id),
                     attention_mask=batch["attention_mask"].to(device_id),
                     pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                    labels=batch["labels"],
+                    labels=batch["labels"],  # Still pass labels for output.loss comparison
                 )
-                loss = output.loss
+
+                # Compute soft target loss for action tokens
+                loss, num_action_tokens = compute_soft_target_action_loss(
+                    logits=output.logits,
+                    labels=batch["labels"].to(device_id),
+                    action_token_begin_idx=action_tokenizer.action_token_begin_idx,
+                    vocab_size=vocab_size,
+                    num_image_patches=num_image_patches,
+                    n_bins=action_tokenizer.n_bins,
+                    sigma=cfg.soft_target_sigma,
+                )
 
             # Normalize loss to account for gradient accumulation
             normalized_loss = loss / cfg.grad_accumulation_steps
@@ -272,7 +411,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalized_loss.backward()
 
             # Compute Accuracy and L1 Loss for Logging
-            action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
+            action_logits = output.logits[:, num_image_patches : -1]
             action_preds = action_logits.argmax(dim=2)
             action_gt = batch["labels"][:, 1:].to(action_preds.device)
             mask = action_gt > action_tokenizer.action_token_begin_idx
@@ -305,8 +444,6 @@ def finetune(cfg: FinetuneConfig) -> None:
             gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
 
             # Compute smoothened train metrics
-            #   =>> Equal to current step metrics when not using gradient accumulation
-            #   =>> Otherwise, equal to the average of metrics observed over micro-batches used for gradient accumulation
             smoothened_loss = sum(recent_losses) / len(recent_losses)
             smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
             smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
@@ -318,6 +455,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                         "train_loss": smoothened_loss,
                         "action_accuracy": smoothened_action_accuracy,
                         "l1_loss": smoothened_l1_loss,
+                        "hard_ce_loss": output.loss.item(),  # Also log original hard CE loss for comparison
                     },
                     step=gradient_step_idx,
                 )
@@ -328,8 +466,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 optimizer.zero_grad()
                 progress.update()
 
-            # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            # Note: Only save on actual gradient steps (when optimizer.step() was called)
+            # Save Model Checkpoint
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0 and gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
                 if distributed_state.is_main_process:
                     print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
@@ -345,7 +482,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                 dist.barrier()
 
                 # Merge LoRA weights into model backbone for faster inference
-                #   =>> Note that merging is slow and can be done post-hoc to speed up training
                 if cfg.use_lora:
                     base_vla = AutoModelForVision2Seq.from_pretrained(
                         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
@@ -354,22 +490,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                     merged_vla = merged_vla.merge_and_unload()
                     if distributed_state.is_main_process:
                         if cfg.save_latest_checkpoint_only:
-                            # Overwrite latest checkpoint
                             merged_vla.save_pretrained(run_dir)
-
                             print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
                         else:
-                            # Prepare to save checkpoint in new directory
                             checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
                             os.makedirs(checkpoint_dir, exist_ok=True)
-
-                            # Save dataset statistics to new directory
                             save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
-
-                            # Save processor and model weights to new directory
                             processor.save_pretrained(checkpoint_dir)
                             merged_vla.save_pretrained(checkpoint_dir)
-
                             print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
 
                 # Block on Main Process Checkpointing
