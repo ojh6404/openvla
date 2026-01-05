@@ -304,8 +304,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         trust_remote_code=True,
     )
 
-    # Get vocab size for loss computation (before DDP wrapping)
-    vocab_size = vla.config.text_config.vocab_size
+    # Get vocab size for loss computation
+    # IMPORTANT: Use tokenizer's vocab_size (not model config) to match ActionTokenizer
+    # The model config may have padded vocab_size, but action tokens use tokenizer's vocab_size
+    vocab_size = processor.tokenizer.vocab_size
 
     # Device Placement =>> note that BitsAndBytes automatically handles for quantized training
     if cfg.use_quantization:
