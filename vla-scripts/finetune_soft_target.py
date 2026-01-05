@@ -154,11 +154,14 @@ def compute_soft_target_action_loss(
     # Slice logits to skip image patches and align with labels
     # logits[:, num_patches:-1] predicts labels[:, 1:]
     # (The last logit predicts next token after sequence, which we don't have label for)
-    text_logits = logits[:, num_image_patches:-1, :].contiguous()  # [batch, text_seq_len-1, vocab_size]
+    text_logits = logits[:, num_image_patches:-1, :].contiguous()  # [batch, text_seq_len-1, logits_vocab_size]
     shift_labels = labels[:, 1:].contiguous()  # [batch, text_seq_len-1]
 
+    # Get actual logits vocab size (may be padded, e.g., 32064 vs tokenizer's 32000)
+    logits_vocab_size = text_logits.shape[-1]
+
     # Flatten
-    text_logits = text_logits.view(-1, vocab_size)  # [batch * (text_seq_len-1), vocab_size]
+    text_logits = text_logits.view(-1, logits_vocab_size)  # [batch * (text_seq_len-1), logits_vocab_size]
     shift_labels = shift_labels.view(-1)  # [batch * (text_seq_len-1)]
 
     # Find action token positions (labels that are action tokens, not -100)
@@ -181,11 +184,11 @@ def compute_soft_target_action_loss(
     # Clamp to valid range (handles edge cases)
     action_bin_indices = torch.clamp(action_bin_indices, 0, n_bins - 1)
 
-    # Extract only action token logits (last n_bins of vocabulary)
-    # Note: In vocabulary, token (vocab_size - n_bins) is at index -n_bins, token (vocab_size - 1) is at index -1
-    # But we want logits ordered by bin index: logit[0] = bin 0 (lowest action), logit[255] = bin 255 (highest)
-    # Since token (vocab_size - 1) corresponds to bin 0, we need to flip the order
-    action_token_logits = action_logits[:, -n_bins:].flip(dims=[-1])  # [num_action_tokens, n_bins]
+    # Extract only action token logits from positions (vocab_size - n_bins) to (vocab_size - 1)
+    # Note: We use tokenizer's vocab_size, not logits_vocab_size (which may be padded)
+    # Action tokens are at vocab_size - n_bins (bin 255) to vocab_size - 1 (bin 0)
+    # We flip to get logits ordered by bin index: logit[0] = bin 0, logit[255] = bin 255
+    action_token_logits = action_logits[:, vocab_size - n_bins : vocab_size].flip(dims=[-1])  # [num_action_tokens, n_bins]
 
     # Create soft targets
     soft_targets = create_gaussian_soft_target(
