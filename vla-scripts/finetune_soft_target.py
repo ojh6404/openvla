@@ -1,17 +1,21 @@
 """
 finetune_soft_target.py
 
-Parameter-efficient fine-tuning of OpenVLA models with alternative loss functions.
-Instead of hard cross-entropy loss (only correct bin gets weight 1), we provide:
+Parameter-efficient fine-tuning of OpenVLA models with various loss functions.
+Supports multiple loss types for action token prediction:
 
-    1. soft_ce (default): Gaussian soft target distribution centered on the correct bin,
+    1. hard_ce: Standard hard cross-entropy loss (same as finetune.py)
+       Only the correct bin gets weight 1, all others get 0.
+
+    2. soft_ce (default): Gaussian soft target distribution centered on the correct bin,
        allowing the model to learn that nearby bins represent similar actions.
 
-    2. wasserstein: 1D Wasserstein distance (Earth Mover's Distance) using closed-form
+    3. wasserstein: 1D Wasserstein distance (Earth Mover's Distance) using closed-form
        CDF solution. Considers the geometry of the action space.
+       Supports soft target (sigma > 0) for combining Wasserstein geometry with soft tolerance.
 
-    3. sinkhorn: Entropy-regularized optimal transport distance. More general but
-       computationally heavier.
+    4. sinkhorn: Entropy-regularized optimal transport distance. More general but
+       computationally heavier. Also supports soft target (sigma > 0).
 
 Notes & Benchmarks:
     - Requires PEFT (`pip install peft==0.11.1`)
@@ -29,6 +33,7 @@ Run with:
                                     --soft_target_sigma 2.0 \
                                     ...
 
+    - [Hard CE Loss]: torchrun ... vla-scripts/finetune_soft_target.py --loss_type hard_ce ...
     - [Wasserstein Loss]: torchrun ... vla-scripts/finetune_soft_target.py --loss_type wasserstein ...
     - [Sinkhorn Loss]: torchrun ... vla-scripts/finetune_soft_target.py --loss_type sinkhorn --sinkhorn_epsilon 0.1 ...
 """
@@ -138,10 +143,33 @@ def soft_cross_entropy_loss(
         return loss
 
 
+def hard_cross_entropy_loss(
+    logits: torch.Tensor,
+    target_indices: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Compute standard (hard) cross-entropy loss.
+
+    This is the same loss used in the original finetune.py - only the correct
+    bin gets probability 1, all others get 0.
+
+    Args:
+        logits: Raw logits of shape [N, num_classes]
+        target_indices: Target class indices of shape [N]
+        reduction: 'mean', 'sum', or 'none'
+
+    Returns:
+        Cross-entropy loss
+    """
+    return F.cross_entropy(logits, target_indices, reduction=reduction)
+
+
 def wasserstein_1d_loss(
     logits: torch.Tensor,
     target_indices: torch.Tensor,
     n_bins: int = 256,
+    sigma: float = 0.0,
     reduction: str = "mean",
 ) -> torch.Tensor:
     """
@@ -151,11 +179,14 @@ def wasserstein_1d_loss(
         W_1(P, Q) = sum(|CDF_P - CDF_Q|)
 
     This loss considers the geometry of the action space - nearby bins are treated as more similar.
+    When sigma > 0, uses Gaussian soft target instead of one-hot, combining benefits of both
+    Wasserstein geometry and soft target tolerance.
 
     Args:
         logits: Raw logits of shape [N, n_bins]
         target_indices: Target bin indices of shape [N]
         n_bins: Number of action bins
+        sigma: Gaussian sigma for soft targets. If 0, uses hard (one-hot) target.
         reduction: 'mean', 'sum', or 'none'
 
     Returns:
@@ -164,9 +195,19 @@ def wasserstein_1d_loss(
     # Convert logits to probabilities
     pred_probs = F.softmax(logits, dim=-1)  # [N, n_bins]
 
-    # Create one-hot target distribution
-    target_probs = torch.zeros_like(pred_probs)
-    target_probs.scatter_(1, target_indices.unsqueeze(1), 1.0)
+    # Create target distribution (soft or hard)
+    if sigma > 0:
+        # Gaussian soft target
+        target_probs = create_gaussian_soft_target(
+            target_indices,
+            num_classes=n_bins,
+            sigma=sigma,
+            device=logits.device,
+        )
+    else:
+        # One-hot hard target
+        target_probs = torch.zeros_like(pred_probs)
+        target_probs.scatter_(1, target_indices.unsqueeze(1), 1.0)
 
     # Compute CDFs (cumulative distribution functions)
     pred_cdf = torch.cumsum(pred_probs, dim=-1)
@@ -188,6 +229,7 @@ def sinkhorn_loss(
     logits: torch.Tensor,
     target_indices: torch.Tensor,
     n_bins: int = 256,
+    sigma: float = 0.0,
     epsilon: float = 0.1,
     n_iters: int = 50,
     reduction: str = "mean",
@@ -197,11 +239,13 @@ def sinkhorn_loss(
 
     Sinkhorn provides a differentiable approximation to optimal transport distance.
     For 1D case, this is more expensive than closed-form Wasserstein but more general.
+    When sigma > 0, uses Gaussian soft target instead of one-hot.
 
     Args:
         logits: Raw logits of shape [N, n_bins]
         target_indices: Target bin indices of shape [N]
         n_bins: Number of action bins
+        sigma: Gaussian sigma for soft targets. If 0, uses hard (one-hot) target.
         epsilon: Entropy regularization parameter (smaller = closer to true Wasserstein)
         n_iters: Number of Sinkhorn iterations
         reduction: 'mean', 'sum', or 'none'
@@ -215,9 +259,19 @@ def sinkhorn_loss(
     # Convert logits to probabilities
     pred_probs = F.softmax(logits, dim=-1)  # [N, n_bins]
 
-    # Create one-hot target distribution
-    target_probs = torch.zeros_like(pred_probs)
-    target_probs.scatter_(1, target_indices.unsqueeze(1), 1.0)
+    # Create target distribution (soft or hard)
+    if sigma > 0:
+        # Gaussian soft target
+        target_probs = create_gaussian_soft_target(
+            target_indices,
+            num_classes=n_bins,
+            sigma=sigma,
+            device=device,
+        )
+    else:
+        # One-hot hard target
+        target_probs = torch.zeros_like(pred_probs)
+        target_probs.scatter_(1, target_indices.unsqueeze(1), 1.0)
 
     # Add small epsilon to avoid numerical issues
     pred_probs = pred_probs + 1e-8
@@ -280,6 +334,7 @@ def compute_soft_target_action_loss(
         num_image_patches: Number of image patch tokens to skip in logits
         n_bins: Number of action bins
         loss_type: Type of loss function to use
+            - "hard_ce": Standard cross-entropy (same as finetune.py)
             - "soft_ce": Soft cross-entropy with Gaussian targets (default)
             - "wasserstein": 1D Wasserstein distance (Earth Mover's Distance)
             - "sinkhorn": Sinkhorn distance (entropy-regularized OT)
@@ -330,7 +385,11 @@ def compute_soft_target_action_loss(
     action_token_logits = action_logits[:, vocab_size - n_bins : vocab_size].flip(dims=[-1])  # [num_action_tokens, n_bins]
 
     # Compute loss based on loss_type
-    if loss_type == "soft_ce":
+    if loss_type == "hard_ce":
+        # Standard hard cross-entropy (same as finetune.py)
+        loss = hard_cross_entropy_loss(action_token_logits, action_bin_indices, reduction="mean")
+
+    elif loss_type == "soft_ce":
         # Soft cross-entropy with Gaussian targets
         soft_targets = create_gaussian_soft_target(
             action_bin_indices,
@@ -342,26 +401,30 @@ def compute_soft_target_action_loss(
 
     elif loss_type == "wasserstein":
         # 1D Wasserstein distance (closed-form solution using CDFs)
+        # Uses soft target if sigma > 0, combining Wasserstein geometry with soft target tolerance
         loss = wasserstein_1d_loss(
             action_token_logits,
             action_bin_indices,
             n_bins=n_bins,
+            sigma=sigma,
             reduction="mean",
         )
 
     elif loss_type == "sinkhorn":
         # Sinkhorn distance (entropy-regularized optimal transport)
+        # Uses soft target if sigma > 0
         loss = sinkhorn_loss(
             action_token_logits,
             action_bin_indices,
             n_bins=n_bins,
+            sigma=sigma,
             epsilon=sinkhorn_epsilon,
             n_iters=sinkhorn_iters,
             reduction="mean",
         )
 
     else:
-        raise ValueError(f"Unknown loss_type: {loss_type}. Choose from 'soft_ce', 'wasserstein', 'sinkhorn'.")
+        raise ValueError(f"Unknown loss_type: {loss_type}. Choose from 'hard_ce', 'soft_ce', 'wasserstein', 'sinkhorn'.")
 
     return loss, action_mask.sum().item()
 
@@ -390,16 +453,18 @@ class FinetuneConfig:
                                                                     #   (If False, saves all checkpoints)
 
     # Loss Function Parameters
-    loss_type: str = "soft_ce"                                      # Loss function type: "soft_ce", "wasserstein", "sinkhorn"
+    loss_type: str = "soft_ce"                                      # Loss function type: "hard_ce", "soft_ce", "wasserstein", "sinkhorn"
+                                                                    #   hard_ce: Standard cross-entropy (same as finetune.py)
                                                                     #   soft_ce: Gaussian soft cross-entropy (default)
                                                                     #   wasserstein: 1D Wasserstein distance (EMD)
                                                                     #   sinkhorn: Sinkhorn distance (regularized OT)
 
-    # Soft CE Parameters (only used when loss_type="soft_ce")
+    # Soft Target Parameters (used by soft_ce, wasserstein, sinkhorn)
     soft_target_sigma: float = 2.0                                  # Gaussian sigma for soft targets (in bin units)
                                                                     #   Higher = softer targets, more tolerance for nearby bins
                                                                     #   sigma=1.0 means ~68% weight within +/- 1 bin
                                                                     #   sigma=2.0 means ~68% weight within +/- 2 bins
+                                                                    #   For wasserstein/sinkhorn: set to 0 for hard target
 
     # Sinkhorn Parameters (only used when loss_type="sinkhorn")
     sinkhorn_epsilon: float = 0.1                                   # Entropy regularization (smaller = closer to true Wasserstein)
@@ -428,7 +493,9 @@ class FinetuneConfig:
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
     # Print loss type specific info
-    if cfg.loss_type == "soft_ce":
+    if cfg.loss_type == "hard_ce":
+        loss_info = "Hard CE Loss (standard cross-entropy)"
+    elif cfg.loss_type == "soft_ce":
         loss_info = f"Soft CE Loss (sigma={cfg.soft_target_sigma})"
     elif cfg.loss_type == "wasserstein":
         loss_info = "Wasserstein-1D Loss"
@@ -451,7 +518,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         f"+lr-{cfg.learning_rate}"
     )
     # Add loss type specific suffix
-    if cfg.loss_type == "soft_ce":
+    if cfg.loss_type == "hard_ce":
+        exp_id += "+hard_ce"
+    elif cfg.loss_type == "soft_ce":
         exp_id += f"+soft_ce-sigma{cfg.soft_target_sigma}"
     elif cfg.loss_type == "wasserstein":
         exp_id += "+wasserstein"
