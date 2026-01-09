@@ -1,10 +1,17 @@
 """
 finetune_soft_target.py
 
-Parameter-efficient fine-tuning of OpenVLA models with soft target loss.
-Instead of hard cross-entropy loss (only correct bin gets weight 1), we use a
-Gaussian soft target distribution centered on the correct bin, allowing the model
-to learn that nearby bins represent similar actions.
+Parameter-efficient fine-tuning of OpenVLA models with alternative loss functions.
+Instead of hard cross-entropy loss (only correct bin gets weight 1), we provide:
+
+    1. soft_ce (default): Gaussian soft target distribution centered on the correct bin,
+       allowing the model to learn that nearby bins represent similar actions.
+
+    2. wasserstein: 1D Wasserstein distance (Earth Mover's Distance) using closed-form
+       CDF solution. Considers the geometry of the action space.
+
+    3. sinkhorn: Entropy-regularized optimal transport distance. More general but
+       computationally heavier.
 
 Notes & Benchmarks:
     - Requires PEFT (`pip install peft==0.11.1`)
@@ -18,8 +25,12 @@ Run with:
                                     --data_root_dir <PATH/TO/RLDS/DATASETS/DIRECTORY> \
                                     --dataset_name <DATASET_NAME> \
                                     --run_root_dir <PATH/TO/LOGS/DIR> \
+                                    --loss_type soft_ce \
                                     --soft_target_sigma 2.0 \
                                     ...
+
+    - [Wasserstein Loss]: torchrun ... vla-scripts/finetune_soft_target.py --loss_type wasserstein ...
+    - [Sinkhorn Loss]: torchrun ... vla-scripts/finetune_soft_target.py --loss_type sinkhorn --sinkhorn_epsilon 0.1 ...
 """
 
 import os
@@ -127,6 +138,125 @@ def soft_cross_entropy_loss(
         return loss
 
 
+def wasserstein_1d_loss(
+    logits: torch.Tensor,
+    target_indices: torch.Tensor,
+    n_bins: int = 256,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Compute 1D Wasserstein distance (Earth Mover's Distance) between predicted distribution and target.
+
+    For 1D distributions, Wasserstein-1 has a closed-form solution using CDFs:
+        W_1(P, Q) = sum(|CDF_P - CDF_Q|)
+
+    This loss considers the geometry of the action space - nearby bins are treated as more similar.
+
+    Args:
+        logits: Raw logits of shape [N, n_bins]
+        target_indices: Target bin indices of shape [N]
+        n_bins: Number of action bins
+        reduction: 'mean', 'sum', or 'none'
+
+    Returns:
+        Wasserstein-1 distance loss
+    """
+    # Convert logits to probabilities
+    pred_probs = F.softmax(logits, dim=-1)  # [N, n_bins]
+
+    # Create one-hot target distribution
+    target_probs = torch.zeros_like(pred_probs)
+    target_probs.scatter_(1, target_indices.unsqueeze(1), 1.0)
+
+    # Compute CDFs (cumulative distribution functions)
+    pred_cdf = torch.cumsum(pred_probs, dim=-1)
+    target_cdf = torch.cumsum(target_probs, dim=-1)
+
+    # Wasserstein-1 distance = sum of absolute CDF differences
+    # Normalize by n_bins to keep loss scale similar to cross-entropy
+    wasserstein = torch.sum(torch.abs(pred_cdf - target_cdf), dim=-1) / n_bins
+
+    if reduction == "mean":
+        return wasserstein.mean()
+    elif reduction == "sum":
+        return wasserstein.sum()
+    else:
+        return wasserstein
+
+
+def sinkhorn_loss(
+    logits: torch.Tensor,
+    target_indices: torch.Tensor,
+    n_bins: int = 256,
+    epsilon: float = 0.1,
+    n_iters: int = 50,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Compute Sinkhorn distance (entropy-regularized Wasserstein) between predicted distribution and target.
+
+    Sinkhorn provides a differentiable approximation to optimal transport distance.
+    For 1D case, this is more expensive than closed-form Wasserstein but more general.
+
+    Args:
+        logits: Raw logits of shape [N, n_bins]
+        target_indices: Target bin indices of shape [N]
+        n_bins: Number of action bins
+        epsilon: Entropy regularization parameter (smaller = closer to true Wasserstein)
+        n_iters: Number of Sinkhorn iterations
+        reduction: 'mean', 'sum', or 'none'
+
+    Returns:
+        Sinkhorn distance loss
+    """
+    N = logits.shape[0]
+    device = logits.device
+
+    # Convert logits to probabilities
+    pred_probs = F.softmax(logits, dim=-1)  # [N, n_bins]
+
+    # Create one-hot target distribution
+    target_probs = torch.zeros_like(pred_probs)
+    target_probs.scatter_(1, target_indices.unsqueeze(1), 1.0)
+
+    # Add small epsilon to avoid numerical issues
+    pred_probs = pred_probs + 1e-8
+    pred_probs = pred_probs / pred_probs.sum(dim=-1, keepdim=True)
+    target_probs = target_probs + 1e-8
+    target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
+
+    # Cost matrix: |i - j| / n_bins for normalized 1D distance
+    indices = torch.arange(n_bins, device=device, dtype=torch.float32)
+    cost_matrix = torch.abs(indices.unsqueeze(0) - indices.unsqueeze(1)) / n_bins  # [n_bins, n_bins]
+
+    # Gibbs kernel
+    K = torch.exp(-cost_matrix / epsilon)  # [n_bins, n_bins]
+
+    # Sinkhorn iterations
+    # u, v are scaling vectors
+    u = torch.ones(N, n_bins, device=device)
+    v = torch.ones(N, n_bins, device=device)
+
+    for _ in range(n_iters):
+        # u = pred_probs / (K @ v)
+        u = pred_probs / (torch.matmul(K, v.unsqueeze(-1)).squeeze(-1) + 1e-8)
+        # v = target_probs / (K.T @ u)
+        v = target_probs / (torch.matmul(K.T, u.unsqueeze(-1)).squeeze(-1) + 1e-8)
+
+    # Compute transport plan: T = diag(u) @ K @ diag(v)
+    # Sinkhorn distance = <T, C> = sum(T * C)
+    # T[i,j] = u[i] * K[i,j] * v[j]
+    transport = u.unsqueeze(-1) * K.unsqueeze(0) * v.unsqueeze(-2)  # [N, n_bins, n_bins]
+    sinkhorn_dist = (transport * cost_matrix.unsqueeze(0)).sum(dim=(-1, -2))  # [N]
+
+    if reduction == "mean":
+        return sinkhorn_dist.mean()
+    elif reduction == "sum":
+        return sinkhorn_dist.sum()
+    else:
+        return sinkhorn_dist
+
+
 def compute_soft_target_action_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -134,10 +264,13 @@ def compute_soft_target_action_loss(
     vocab_size: int,
     num_image_patches: int,
     n_bins: int = 256,
+    loss_type: str = "soft_ce",
     sigma: float = 2.0,
+    sinkhorn_epsilon: float = 0.1,
+    sinkhorn_iters: int = 50,
 ) -> tuple[torch.Tensor, int]:
     """
-    Compute soft target loss for action tokens only.
+    Compute action loss for action tokens only with various loss types.
 
     Args:
         logits: Model output logits [batch, seq_len, vocab_size] (includes image patches)
@@ -146,7 +279,13 @@ def compute_soft_target_action_loss(
         vocab_size: Total vocabulary size
         num_image_patches: Number of image patch tokens to skip in logits
         n_bins: Number of action bins
-        sigma: Gaussian sigma for soft targets
+        loss_type: Type of loss function to use
+            - "soft_ce": Soft cross-entropy with Gaussian targets (default)
+            - "wasserstein": 1D Wasserstein distance (Earth Mover's Distance)
+            - "sinkhorn": Sinkhorn distance (entropy-regularized OT)
+        sigma: Gaussian sigma for soft targets (only used when loss_type="soft_ce")
+        sinkhorn_epsilon: Entropy regularization for Sinkhorn (only used when loss_type="sinkhorn")
+        sinkhorn_iters: Number of Sinkhorn iterations (only used when loss_type="sinkhorn")
 
     Returns:
         Tuple of (loss, num_action_tokens)
@@ -190,16 +329,39 @@ def compute_soft_target_action_loss(
     # We flip to get logits ordered by bin index: logit[0] = bin 0, logit[255] = bin 255
     action_token_logits = action_logits[:, vocab_size - n_bins : vocab_size].flip(dims=[-1])  # [num_action_tokens, n_bins]
 
-    # Create soft targets
-    soft_targets = create_gaussian_soft_target(
-        action_bin_indices,
-        num_classes=n_bins,
-        sigma=sigma,
-        device=action_logits.device,
-    )
+    # Compute loss based on loss_type
+    if loss_type == "soft_ce":
+        # Soft cross-entropy with Gaussian targets
+        soft_targets = create_gaussian_soft_target(
+            action_bin_indices,
+            num_classes=n_bins,
+            sigma=sigma,
+            device=action_logits.device,
+        )
+        loss = soft_cross_entropy_loss(action_token_logits, soft_targets, reduction="mean")
 
-    # Compute soft cross-entropy loss
-    loss = soft_cross_entropy_loss(action_token_logits, soft_targets, reduction="mean")
+    elif loss_type == "wasserstein":
+        # 1D Wasserstein distance (closed-form solution using CDFs)
+        loss = wasserstein_1d_loss(
+            action_token_logits,
+            action_bin_indices,
+            n_bins=n_bins,
+            reduction="mean",
+        )
+
+    elif loss_type == "sinkhorn":
+        # Sinkhorn distance (entropy-regularized optimal transport)
+        loss = sinkhorn_loss(
+            action_token_logits,
+            action_bin_indices,
+            n_bins=n_bins,
+            epsilon=sinkhorn_epsilon,
+            n_iters=sinkhorn_iters,
+            reduction="mean",
+        )
+
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}. Choose from 'soft_ce', 'wasserstein', 'sinkhorn'.")
 
     return loss, action_mask.sum().item()
 
@@ -227,11 +389,21 @@ class FinetuneConfig:
                                                                     #   continually overwrite the latest checkpoint
                                                                     #   (If False, saves all checkpoints)
 
-    # Soft Target Loss Parameters
+    # Loss Function Parameters
+    loss_type: str = "soft_ce"                                      # Loss function type: "soft_ce", "wasserstein", "sinkhorn"
+                                                                    #   soft_ce: Gaussian soft cross-entropy (default)
+                                                                    #   wasserstein: 1D Wasserstein distance (EMD)
+                                                                    #   sinkhorn: Sinkhorn distance (regularized OT)
+
+    # Soft CE Parameters (only used when loss_type="soft_ce")
     soft_target_sigma: float = 2.0                                  # Gaussian sigma for soft targets (in bin units)
                                                                     #   Higher = softer targets, more tolerance for nearby bins
                                                                     #   sigma=1.0 means ~68% weight within +/- 1 bin
                                                                     #   sigma=2.0 means ~68% weight within +/- 2 bins
+
+    # Sinkhorn Parameters (only used when loss_type="sinkhorn")
+    sinkhorn_epsilon: float = 0.1                                   # Entropy regularization (smaller = closer to true Wasserstein)
+    sinkhorn_iters: int = 50                                        # Number of Sinkhorn iterations
 
     # Accuracy Margin Parameter
     action_accuracy_margin: int = 0                                 # Margin for action accuracy calculation (in bins)
@@ -255,7 +427,16 @@ class FinetuneConfig:
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
-    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}` with Soft Target Loss (sigma={cfg.soft_target_sigma})")
+    # Print loss type specific info
+    if cfg.loss_type == "soft_ce":
+        loss_info = f"Soft CE Loss (sigma={cfg.soft_target_sigma})"
+    elif cfg.loss_type == "wasserstein":
+        loss_info = "Wasserstein-1D Loss"
+    elif cfg.loss_type == "sinkhorn":
+        loss_info = f"Sinkhorn Loss (epsilon={cfg.sinkhorn_epsilon}, iters={cfg.sinkhorn_iters})"
+    else:
+        loss_info = f"Unknown Loss ({cfg.loss_type})"
+    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}` with {loss_info}")
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
@@ -268,8 +449,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
         f"+lr-{cfg.learning_rate}"
-        f"+soft-sigma{cfg.soft_target_sigma}"
     )
+    # Add loss type specific suffix
+    if cfg.loss_type == "soft_ce":
+        exp_id += f"+soft_ce-sigma{cfg.soft_target_sigma}"
+    elif cfg.loss_type == "wasserstein":
+        exp_id += "+wasserstein"
+    elif cfg.loss_type == "sinkhorn":
+        exp_id += f"+sinkhorn-eps{cfg.sinkhorn_epsilon}"
     if cfg.use_lora:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
     if cfg.use_quantization:
@@ -398,7 +585,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     labels=batch["labels"],  # Still pass labels for output.loss comparison
                 )
 
-                # Compute soft target loss for action tokens
+                # Compute action loss (soft_ce, wasserstein, or sinkhorn)
                 loss, num_action_tokens = compute_soft_target_action_loss(
                     logits=output.logits,
                     labels=batch["labels"].to(device_id),
@@ -406,7 +593,10 @@ def finetune(cfg: FinetuneConfig) -> None:
                     vocab_size=vocab_size,
                     num_image_patches=num_image_patches,
                     n_bins=action_tokenizer.n_bins,
+                    loss_type=cfg.loss_type,
                     sigma=cfg.soft_target_sigma,
+                    sinkhorn_epsilon=cfg.sinkhorn_epsilon,
+                    sinkhorn_iters=cfg.sinkhorn_iters,
                 )
 
             # Normalize loss to account for gradient accumulation
