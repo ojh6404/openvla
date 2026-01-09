@@ -188,8 +188,14 @@ def wasserstein_1d_loss(
     Returns:
         Wasserstein-1 distance loss
     """
-    # Convert logits to probabilities
-    pred_probs = F.softmax(logits, dim=-1)  # [N, n_bins]
+    # Convert logits to probabilities with numerical stability
+    # Subtract max for numerical stability before softmax
+    logits_stable = logits - logits.max(dim=-1, keepdim=True).values
+    pred_probs = F.softmax(logits_stable, dim=-1)  # [N, n_bins]
+
+    # Add small epsilon and renormalize to avoid numerical issues in CDF
+    pred_probs = pred_probs + 1e-8
+    pred_probs = pred_probs / pred_probs.sum(dim=-1, keepdim=True)
 
     # Create target distribution (soft or hard)
     if sigma > 0:
@@ -208,6 +214,10 @@ def wasserstein_1d_loss(
     # Compute CDFs (cumulative distribution functions)
     pred_cdf = torch.cumsum(pred_probs, dim=-1)
     target_cdf = torch.cumsum(target_probs, dim=-1)
+
+    # Clamp CDFs to [0, 1] for numerical stability
+    pred_cdf = torch.clamp(pred_cdf, 0.0, 1.0)
+    target_cdf = torch.clamp(target_cdf, 0.0, 1.0)
 
     # Wasserstein-1 distance = sum of absolute CDF differences
     # Normalize by n_bins to keep loss scale similar to cross-entropy
@@ -318,6 +328,7 @@ def compute_soft_target_action_loss(
     sigma: float = 2.0,
     sinkhorn_epsilon: float = 0.1,
     sinkhorn_iters: int = 50,
+    ot_loss_scale: float = 10.0,
 ) -> tuple[torch.Tensor, int]:
     """
     Compute action loss for action tokens only with various loss types.
@@ -337,6 +348,7 @@ def compute_soft_target_action_loss(
         sigma: Gaussian sigma for soft targets (only used when loss_type="soft_ce")
         sinkhorn_epsilon: Entropy regularization for Sinkhorn (only used when loss_type="sinkhorn")
         sinkhorn_iters: Number of Sinkhorn iterations (only used when loss_type="sinkhorn")
+        ot_loss_scale: Scale factor for wasserstein/sinkhorn losses (to match CE magnitude)
 
     Returns:
         Tuple of (loss, num_action_tokens)
@@ -400,25 +412,33 @@ def compute_soft_target_action_loss(
     elif loss_type == "wasserstein":
         # 1D Wasserstein distance (closed-form solution using CDFs)
         # Uses soft target if sigma > 0, combining Wasserstein geometry with soft target tolerance
-        loss = wasserstein_1d_loss(
-            action_token_logits,
-            action_bin_indices,
-            n_bins=n_bins,
-            sigma=sigma,
-            reduction="mean",
+        # Scale to match CE loss magnitude for stable training
+        loss = (
+            wasserstein_1d_loss(
+                action_token_logits,
+                action_bin_indices,
+                n_bins=n_bins,
+                sigma=sigma,
+                reduction="mean",
+            )
+            * ot_loss_scale
         )
 
     elif loss_type == "sinkhorn":
         # Sinkhorn distance (entropy-regularized optimal transport)
         # Uses soft target if sigma > 0
-        loss = sinkhorn_loss(
-            action_token_logits,
-            action_bin_indices,
-            n_bins=n_bins,
-            sigma=sigma,
-            epsilon=sinkhorn_epsilon,
-            n_iters=sinkhorn_iters,
-            reduction="mean",
+        # Scale to match CE loss magnitude for stable training
+        loss = (
+            sinkhorn_loss(
+                action_token_logits,
+                action_bin_indices,
+                n_bins=n_bins,
+                sigma=sigma,
+                epsilon=sinkhorn_epsilon,
+                n_iters=sinkhorn_iters,
+                reduction="mean",
+            )
+            * ot_loss_scale
         )
 
     else:
@@ -463,6 +483,13 @@ class FinetuneConfig:
     sinkhorn_epsilon: float = 0.1  # Entropy regularization
     sinkhorn_iters: int = 50
 
+    # Wasserstein/Sinkhorn Scale (to match CE loss magnitude)
+    # CE loss is typically 1-5, wasserstein is ~0.01-0.3, so scale ~10-20 helps
+    ot_loss_scale: float = 10.0
+
+    # Gradient Clipping (0 = disabled, recommended: 1.0 for wasserstein/sinkhorn)
+    grad_clip_norm: float = 1.0
+
     # Accuracy Margin Parameter (0 = strict, 3 = +/- 3 bins tolerance)
     action_accuracy_margin: int = 0
 
@@ -489,12 +516,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     elif cfg.loss_type == "soft_ce":
         loss_info = f"Soft CE Loss (sigma={cfg.soft_target_sigma})"
     elif cfg.loss_type == "wasserstein":
-        loss_info = "Wasserstein-1D Loss"
+        sigma_str = f", sigma={cfg.soft_target_sigma}" if cfg.soft_target_sigma > 0 else ""
+        loss_info = f"Wasserstein-1D Loss (scale={cfg.ot_loss_scale}{sigma_str})"
     elif cfg.loss_type == "sinkhorn":
-        loss_info = f"Sinkhorn Loss (epsilon={cfg.sinkhorn_epsilon}, iters={cfg.sinkhorn_iters})"
+        sigma_str = f", sigma={cfg.soft_target_sigma}" if cfg.soft_target_sigma > 0 else ""
+        loss_info = f"Sinkhorn Loss (eps={cfg.sinkhorn_epsilon}, iters={cfg.sinkhorn_iters}, scale={cfg.ot_loss_scale}{sigma_str})"
     else:
         loss_info = f"Unknown Loss ({cfg.loss_type})"
-    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}` with {loss_info}")
+    grad_clip_info = f", grad_clip={cfg.grad_clip_norm}" if cfg.grad_clip_norm > 0 else ""
+    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}` with {loss_info}{grad_clip_info}")
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
@@ -514,9 +544,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     elif cfg.loss_type == "soft_ce":
         exp_id += f"+soft_ce-sigma{cfg.soft_target_sigma}"
     elif cfg.loss_type == "wasserstein":
-        exp_id += "+wasserstein"
+        exp_id += f"+wasserstein-scale{cfg.ot_loss_scale}"
+        if cfg.soft_target_sigma > 0:
+            exp_id += f"-sigma{cfg.soft_target_sigma}"
     elif cfg.loss_type == "sinkhorn":
-        exp_id += f"+sinkhorn-eps{cfg.sinkhorn_epsilon}"
+        exp_id += f"+sinkhorn-eps{cfg.sinkhorn_epsilon}-scale{cfg.ot_loss_scale}"
+        if cfg.soft_target_sigma > 0:
+            exp_id += f"-sigma{cfg.soft_target_sigma}"
     if cfg.use_lora:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
     if cfg.use_quantization:
@@ -657,6 +691,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     sigma=cfg.soft_target_sigma,
                     sinkhorn_epsilon=cfg.sinkhorn_epsilon,
                     sinkhorn_iters=cfg.sinkhorn_iters,
+                    ot_loss_scale=cfg.ot_loss_scale,
                 )
 
             # Normalize loss to account for gradient accumulation
@@ -717,6 +752,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Optimizer Step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                # Gradient clipping for training stability (especially useful for wasserstein/sinkhorn)
+                if cfg.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, cfg.grad_clip_norm)
                 optimizer.step()
                 optimizer.zero_grad()
                 progress.update()
