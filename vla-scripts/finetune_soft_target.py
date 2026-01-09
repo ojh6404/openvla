@@ -312,12 +312,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     labels=batch["labels"],  # Still pass labels for output.loss comparison
                 )
 
-                # Compute action loss (soft_ce, wasserstein, sinkhorn, or expected_value)
-                # Get continuous actions for expected_value loss (if available)
-                continuous_actions = batch.get("continuous_actions")
-                if continuous_actions is not None:
-                    continuous_actions = continuous_actions.to(device_id)
-
+                continuous_actions = batch["continuous_actions"].to(device_id)
                 loss, _num_action_tokens = compute_action_loss(
                     logits=output.logits,
                     labels=batch["labels"].to(device_id),
@@ -361,13 +356,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
             )
             # Use actual continuous actions (not bin centers) for accurate L1 evaluation
-            if continuous_actions is not None:
-                continuous_actions_gt = continuous_actions.view(-1).cpu()
-            else:
-                # Fallback to decoded bin centers if continuous_actions not available
-                continuous_actions_gt = torch.tensor(
-                    action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
-                )
+            continuous_actions_gt = continuous_actions.view(-1).cpu()
             action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
 
             # Store recent train metrics
