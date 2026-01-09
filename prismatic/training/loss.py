@@ -259,6 +259,63 @@ def sinkhorn_loss(
         return sinkhorn_dist
 
 
+def expected_value_loss(
+    logits: torch.Tensor,
+    target_values: torch.Tensor,
+    n_bins: int = 256,
+    loss_fn: str = "l1",
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Compute regression loss using expected value (soft argmax) of the probability distribution.
+
+    Instead of discrete bin prediction, this computes:
+        pred_value = sum(softmax(logits) * bin_centers)
+    and uses regression loss against the target continuous value.
+
+    This allows for higher resolution predictions beyond the discrete bin centers.
+
+    Args:
+        logits: Raw logits of shape [N, n_bins]
+        target_values: Target continuous action values of shape [N], in range [-1, 1]
+        n_bins: Number of action bins
+        loss_fn: Regression loss function - "l1" (MAE) or "l2" (MSE)
+        reduction: 'mean', 'sum', or 'none'
+
+    Returns:
+        Regression loss
+    """
+    device = logits.device
+
+    # Convert logits to probabilities
+    probs = F.softmax(logits, dim=-1)  # [N, n_bins]
+
+    # Create bin centers: linearly spaced from -1 to 1
+    # bin 0 -> -1, bin (n_bins-1) -> 1
+    bin_centers = torch.linspace(-1, 1, n_bins, device=device, dtype=logits.dtype)  # [n_bins]
+
+    # Compute expected value (soft argmax)
+    # pred_values[i] = sum_j(probs[i,j] * bin_centers[j])
+    pred_values = torch.sum(probs * bin_centers.unsqueeze(0), dim=-1)  # [N]
+
+    # Compute regression loss
+    if loss_fn == "l1":
+        loss = torch.abs(pred_values - target_values)
+    elif loss_fn == "l2":
+        loss = (pred_values - target_values) ** 2
+    elif loss_fn == "smooth_l1":
+        loss = F.smooth_l1_loss(pred_values, target_values, reduction="none")
+    else:
+        raise ValueError(f"Unknown loss_fn: {loss_fn}. Choose from 'l1', 'l2', 'smooth_l1'.")
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    else:
+        return loss
+
+
 def compute_action_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -271,6 +328,8 @@ def compute_action_loss(
     sinkhorn_epsilon: float = 0.1,
     sinkhorn_iters: int = 50,
     ot_loss_scale: float = 10.0,
+    regression_loss_fn: str = "l1",
+    continuous_actions: torch.Tensor = None,
 ) -> tuple[torch.Tensor, int]:
     """
     Compute action loss for action tokens only with various loss types.
@@ -287,10 +346,13 @@ def compute_action_loss(
             - "soft_ce": Soft cross-entropy with Gaussian targets (default)
             - "wasserstein": 1D Wasserstein distance (Earth Mover's Distance)
             - "sinkhorn": Sinkhorn distance (entropy-regularized OT)
+            - "expected_value": Regression loss on expected value (soft argmax)
         sigma: Gaussian sigma for soft targets (used by soft_ce, wasserstein, sinkhorn)
         sinkhorn_epsilon: Entropy regularization for Sinkhorn (only used when loss_type="sinkhorn")
         sinkhorn_iters: Number of Sinkhorn iterations (only used when loss_type="sinkhorn")
         ot_loss_scale: Scale factor for wasserstein/sinkhorn losses (to match CE magnitude)
+        regression_loss_fn: Regression loss for expected_value - "l1", "l2", or "smooth_l1"
+        continuous_actions: Original continuous action values [batch, action_dim] for expected_value loss
 
     Returns:
         Tuple of (loss, num_action_tokens)
@@ -383,7 +445,41 @@ def compute_action_loss(
             * ot_loss_scale
         )
 
+    elif loss_type == "expected_value":
+        # Regression loss on expected value (soft argmax)
+        # Computes pred = sum(softmax(logits) * bin_centers) and uses L1/L2 loss
+        # This allows continuous predictions beyond discrete bin resolution
+
+        if continuous_actions is None:
+            raise ValueError(
+                "expected_value loss requires continuous_actions to be provided. "
+                "Ensure the data pipeline includes continuous action values."
+            )
+
+        # Use actual continuous action values (not quantized to bin centers)
+        # continuous_actions: [batch, action_dim] -> flatten to match action tokens
+        target_values = continuous_actions.view(-1)
+
+        # Verify shapes match (each sample should have action_dim action tokens)
+        if target_values.shape[0] != action_token_logits.shape[0]:
+            raise ValueError(
+                f"Mismatch between continuous_actions ({target_values.shape[0]}) "
+                f"and action_token_logits ({action_token_logits.shape[0]}). "
+                "Ensure batch has consistent action dimensions."
+            )
+
+        loss = expected_value_loss(
+            action_token_logits,
+            target_values,
+            n_bins=n_bins,
+            loss_fn=regression_loss_fn,
+            reduction="mean",
+        )
+
     else:
-        raise ValueError(f"Unknown loss_type: {loss_type}. Choose from 'hard_ce', 'soft_ce', 'wasserstein', 'sinkhorn'.")
+        raise ValueError(
+            f"Unknown loss_type: {loss_type}. "
+            "Choose from 'hard_ce', 'soft_ce', 'wasserstein', 'sinkhorn', 'expected_value'."
+        )
 
     return loss, action_mask.sum().item()

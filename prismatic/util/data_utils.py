@@ -106,6 +106,9 @@ class PaddedCollatorForActionPrediction:
         else:
             dataset_names = None
 
+        # Extract continuous actions if available (for regression loss)
+        continuous_actions = torch.stack([instance["continuous_actions"] for instance in instances])
+
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
@@ -136,6 +139,7 @@ class PaddedCollatorForActionPrediction:
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            continuous_actions=continuous_actions,
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names

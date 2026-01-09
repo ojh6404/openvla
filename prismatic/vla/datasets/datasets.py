@@ -64,7 +64,17 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name)
+        # Keep continuous action values (normalized to [-1, 1]) for regression loss
+        # Note: action is already normalized by the RLDS pipeline
+        continuous_actions = torch.tensor(action, dtype=torch.float32)
+
+        return dict(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            labels=labels,
+            dataset_name=dataset_name,
+            continuous_actions=continuous_actions,
+        )
 
 
 class RLDSDataset(IterableDataset):

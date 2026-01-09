@@ -95,7 +95,7 @@ class FinetuneConfig:
                                                                     #   (If False, saves all checkpoints)
 
     # Loss Function Parameters
-    # Options: "hard_ce", "soft_ce", "wasserstein", "sinkhorn"
+    # Options: "hard_ce", "soft_ce", "wasserstein", "sinkhorn", "expected_value"
     loss_type: str = "soft_ce"
 
     # Soft Target Parameters (used by soft_ce, wasserstein, sinkhorn)
@@ -110,6 +110,11 @@ class FinetuneConfig:
     # Wasserstein/Sinkhorn Scale (to match CE loss magnitude)
     # CE loss is typically 1-5, wasserstein is ~0.01-0.3, so scale ~10-20 helps
     ot_loss_scale: float = 10.0
+
+    # Expected Value Loss Parameters (only used when loss_type="expected_value")
+    # Regression loss on soft argmax: pred = sum(softmax * bin_centers)
+    # Options: "l1", "l2", "smooth_l1"
+    regression_loss_fn: str = "l1"
 
     # Gradient Clipping (0 = disabled, recommended: 1.0 for wasserstein/sinkhorn)
     grad_clip_norm: float = 1.0
@@ -145,6 +150,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     elif cfg.loss_type == "sinkhorn":
         sigma_str = f", sigma={cfg.soft_target_sigma}" if cfg.soft_target_sigma > 0 else ""
         loss_info = f"Sinkhorn Loss (eps={cfg.sinkhorn_epsilon}, iters={cfg.sinkhorn_iters}, scale={cfg.ot_loss_scale}{sigma_str})"
+    elif cfg.loss_type == "expected_value":
+        loss_info = f"Expected Value Regression Loss ({cfg.regression_loss_fn})"
     else:
         loss_info = f"Unknown Loss ({cfg.loss_type})"
     grad_clip_info = f", grad_clip={cfg.grad_clip_norm}" if cfg.grad_clip_norm > 0 else ""
@@ -175,6 +182,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         exp_id += f"+sinkhorn-eps{cfg.sinkhorn_epsilon}-scale{cfg.ot_loss_scale}"
         if cfg.soft_target_sigma > 0:
             exp_id += f"-sigma{cfg.soft_target_sigma}"
+    elif cfg.loss_type == "expected_value":
+        exp_id += f"+expected_value-{cfg.regression_loss_fn}"
     if cfg.use_lora:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
     if cfg.use_quantization:
@@ -303,7 +312,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                     labels=batch["labels"],  # Still pass labels for output.loss comparison
                 )
 
-                # Compute action loss (soft_ce, wasserstein, or sinkhorn)
+                # Compute action loss (soft_ce, wasserstein, sinkhorn, or expected_value)
+                # Get continuous actions for expected_value loss (if available)
+                continuous_actions = batch.get("continuous_actions")
+                if continuous_actions is not None:
+                    continuous_actions = continuous_actions.to(device_id)
+
                 loss, _num_action_tokens = compute_action_loss(
                     logits=output.logits,
                     labels=batch["labels"].to(device_id),
@@ -316,6 +330,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     sinkhorn_epsilon=cfg.sinkhorn_epsilon,
                     sinkhorn_iters=cfg.sinkhorn_iters,
                     ot_loss_scale=cfg.ot_loss_scale,
+                    regression_loss_fn=cfg.regression_loss_fn,
+                    continuous_actions=continuous_actions,
                 )
 
             # Normalize loss to account for gradient accumulation
