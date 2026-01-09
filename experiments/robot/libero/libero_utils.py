@@ -1,14 +1,15 @@
 """Utils for evaluating policies in LIBERO simulation environments."""
 
+import io
 import math
 import os
-import io
 
 import imageio
+import matplotlib
 import numpy as np
 import tensorflow as tf
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+
+matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -113,18 +114,17 @@ def create_action_prob_plot(all_action_probs, selected_actions=None, step_idx=0,
 
     for i, (probs, ax) in enumerate(zip(all_action_probs, axes)):
         # Use fill_between for smooth visualization
-        ax.fill_between(bin_centers, probs, alpha=0.7, color='steelblue')
-        ax.plot(bin_centers, probs, color='darkblue', linewidth=1)
+        ax.fill_between(bin_centers, probs, alpha=0.7, color="steelblue")
+        ax.plot(bin_centers, probs, color="darkblue", linewidth=1)
 
         # Mark the selected action with a red vertical line
         if selected_actions is not None and i < len(selected_actions):
             selected_val = float(selected_actions[i])
-            ax.axvline(x=selected_val, color='red', linestyle='-', linewidth=2.5,
-                      label=f'Selected: {selected_val:.3f}')
-            ax.legend(loc='upper right', fontsize=10)
+            ax.axvline(x=selected_val, color="red", linestyle="-", linewidth=2.5, label=f"Selected: {selected_val:.3f}")
+            ax.legend(loc="upper right", fontsize=10)
 
         dim_name = action_dim_names[i] if i < len(action_dim_names) else f"dim{i}"
-        ax.set_ylabel(dim_name, fontsize=12, fontweight='bold')
+        ax.set_ylabel(dim_name, fontsize=12, fontweight="bold")
         ax.set_xlim(-1.05, 1.05)
 
         # Set y-axis limit with some padding
@@ -133,21 +133,21 @@ def create_action_prob_plot(all_action_probs, selected_actions=None, step_idx=0,
 
         # Only show x-axis label for the bottom plot
         if i == n_dims - 1:
-            ax.set_xlabel('Action Value (normalized)', fontsize=12)
-        ax.tick_params(axis='both', which='major', labelsize=9)
+            ax.set_xlabel("Action Value (normalized)", fontsize=12)
+        ax.tick_params(axis="both", which="major", labelsize=9)
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle(f'Step {step_idx}: Action Probabilities', fontsize=14, fontweight='bold')
+    fig.suptitle(f"Step {step_idx}: Action Probabilities", fontsize=14, fontweight="bold")
     plt.tight_layout()
 
     # Convert figure to numpy array at HIGH DPI
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', facecolor='white')
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
     buf.seek(0)
 
     # Read image from buffer (keep at high resolution)
     img = Image.open(buf)
-    img_array = np.array(img.convert('RGB'))
+    img_array = np.array(img.convert("RGB"))
 
     plt.close(fig)
     buf.close()
@@ -183,15 +183,16 @@ def combine_image_with_prob_plot(robot_image, prob_plot_image):
     combined_width = target_height + prob_plot_image.shape[1]
 
     # Combine horizontally at high resolution
-    combined = Image.new('RGB', (combined_width, target_height), color=(255, 255, 255))
+    combined = Image.new("RGB", (combined_width, target_height), color=(255, 255, 255))
     combined.paste(robot_pil, (0, 0))
     combined.paste(prob_pil, (target_height, 0))
 
     return np.array(combined)
 
 
-def save_rollout_video_with_probs(rollout_images, prob_data_list, idx, success, task_description,
-                                  log_file=None, video_height=480):
+def save_rollout_video_with_probs(
+    rollout_images, prob_data_list, idx, success, task_description, log_file=None, video_height=480
+):
     """
     Saves an MP4 replay with probability distribution plots.
     Plots are generated at HIGH RESOLUTION, then resized for video output.
@@ -218,11 +219,12 @@ def save_rollout_video_with_probs(rollout_images, prob_data_list, idx, success, 
     rollout_dir = f"./rollouts/{DATE}"
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
-    mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}--with_probs.mp4"
+    mp4_path = (
+        f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}--with_probs.mp4"
+    )
 
     try:
         last_prob_plot = None  # Cache last probability plot (high res)
-        last_combined_highres = None  # Cache last combined frame (high res)
         video_width = None  # Will be determined from first frame
 
         # Pad prob_data_list if shorter than rollout_images
@@ -234,21 +236,20 @@ def save_rollout_video_with_probs(rollout_images, prob_data_list, idx, success, 
 
         for step_idx, (img, prob_data) in enumerate(zip(rollout_images, prob_data_list)):
             try:
-                if prob_data is not None and 'all_action_probs' in prob_data:
+                if prob_data is not None and "all_action_probs" in prob_data:
                     # Create HIGH RESOLUTION probability plot
                     prob_plot = create_action_prob_plot(
-                        prob_data['all_action_probs'],
-                        selected_actions=prob_data.get('normalized_actions'),
+                        prob_data["all_action_probs"],
+                        selected_actions=prob_data.get("normalized_actions"),
                         step_idx=step_idx,
                         figsize=(8, 12),  # Large figure
-                        dpi=150  # High DPI
+                        dpi=150,  # High DPI
                     )
                     last_prob_plot = prob_plot
 
                 if last_prob_plot is not None:
                     # Combine at HIGH RESOLUTION
                     combined_highres = combine_image_with_prob_plot(img, last_prob_plot)
-                    last_combined_highres = combined_highres
                 else:
                     # No probability data yet, just use robot image (upscaled)
                     robot_pil = Image.fromarray(img)
@@ -256,7 +257,6 @@ def save_rollout_video_with_probs(rollout_images, prob_data_list, idx, success, 
                     placeholder_height = 600
                     robot_pil = robot_pil.resize((placeholder_height, placeholder_height), Image.LANCZOS)
                     combined_highres = np.array(robot_pil)
-                    last_combined_highres = combined_highres
 
                 # Determine video dimensions from first valid frame
                 if video_width is None:
@@ -275,6 +275,7 @@ def save_rollout_video_with_probs(rollout_images, prob_data_list, idx, success, 
             except Exception as e:
                 print(f"Warning: Error processing frame {step_idx}: {e}")
                 import traceback
+
                 traceback.print_exc()
                 continue
 
@@ -283,7 +284,7 @@ def save_rollout_video_with_probs(rollout_images, prob_data_list, idx, success, 
             return None
 
         # Write video
-        video_writer = imageio.get_writer(mp4_path, fps=10, codec='libx264', pixelformat='yuv420p')
+        video_writer = imageio.get_writer(mp4_path, fps=10, codec="libx264", pixelformat="yuv420p")
         for frame in frames:
             video_writer.append_data(frame)
         video_writer.close()
@@ -296,6 +297,7 @@ def save_rollout_video_with_probs(rollout_images, prob_data_list, idx, success, 
     except Exception as e:
         print(f"Error saving video with probs: {e}")
         import traceback
+
         traceback.print_exc()
         if log_file is not None:
             log_file.write(f"Error saving video with probs: {e}\n")

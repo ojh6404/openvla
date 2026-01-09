@@ -34,20 +34,18 @@ from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_t
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
-from transformers import AutoConfig, AutoImageProcessor
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -330,7 +328,11 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
             # Note: Only save on actual gradient steps (when optimizer.step() was called)
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0 and gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
+            if (
+                (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+                and gradient_step_idx > 0
+                and gradient_step_idx % cfg.save_steps == 0
+            ):
                 if distributed_state.is_main_process:
                     print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 

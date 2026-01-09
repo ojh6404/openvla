@@ -23,8 +23,8 @@ import draccus
 import numpy as np
 import torch
 import tqdm
-from PIL import Image
 from libero.libero import benchmark
+from PIL import Image
 
 import wandb
 
@@ -38,16 +38,16 @@ from experiments.robot.libero.libero_utils import (
     save_rollout_video,
     save_rollout_video_with_probs,
 )
-from experiments.robot.openvla_utils import get_processor, crop_and_resize, OPENVLA_V01_SYSTEM_PROMPT
+from experiments.robot.openvla_utils import OPENVLA_V01_SYSTEM_PROMPT, crop_and_resize, get_processor
 from experiments.robot.robot_utils import (
+    ACTION_DIM,
     DATE_TIME,
+    DEVICE,
     get_image_resize_size,
     get_model,
     invert_gripper_action,
     normalize_gripper_action,
     set_seed_everywhere,
-    ACTION_DIM,
-    DEVICE,
 )
 
 # Try importing tensorflow for center crop
@@ -218,8 +218,10 @@ def get_vla_action_with_probs(
         normalized_actions.append(action_value)
 
         dim_name = action_dim_names[dim_idx] if dim_idx < len(action_dim_names) else f"dim{dim_idx}"
-        output_lines.append(f"\n  [{dim_name}] Selected: token={token_id.item()}, prob={selected_prob:.4f}, "
-                          f"action={action_value:+.4f}")
+        output_lines.append(
+            f"\n  [{dim_name}] Selected: token={token_id.item()}, prob={selected_prob:.4f}, "
+            f"action={action_value:+.4f}"
+        )
         output_lines.append(f"  Top-{top_k}:")
 
         for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
@@ -232,7 +234,9 @@ def get_vla_action_with_probs(
                 act_idx = np.clip(disc - 1, 0, len(bin_centers) - 1)
                 act_val = bin_centers[act_idx]
                 marker = " <--" if idx_val == token_id.item() else ""
-                output_lines.append(f"    {i+1:2d}. Token {idx_val:5d}: prob={prob_val:.4f}, action={act_val:+.4f}{marker}")
+                output_lines.append(
+                    f"    {i+1:2d}. Token {idx_val:5d}: prob={prob_val:.4f}, action={act_val:+.4f}{marker}"
+                )
             else:
                 marker = " <-- (non-action!)" if idx_val == token_id.item() else " (non-action)"
                 output_lines.append(f"    {i+1:2d}. Token {idx_val:5d}: prob={prob_val:.4f}{marker}")
@@ -402,7 +406,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     if t < cfg.num_steps_wait:
-                        obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
+                        obs, _reward, _done, _info = env.step(get_libero_dummy_action(cfg.model_family))
                         t += 1
                         continue
 
@@ -421,7 +425,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     }
 
                     # Query model to get action (with probability logging)
-                    should_log = (step_count % cfg.log_probs_every_n_steps == 0)
+                    should_log = step_count % cfg.log_probs_every_n_steps == 0
 
                     if should_log:
                         action, prob_info = get_action_with_probs(
@@ -438,6 +442,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     else:
                         # Use regular action prediction without logging
                         from experiments.robot.robot_utils import get_action
+
                         action = get_action(cfg, model, observation, task_description, processor=processor)
                         prob_data_list.append(None)  # No prob data for this step
 
@@ -451,7 +456,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         action = invert_gripper_action(action)
 
                     # Execute action in environment
-                    obs, reward, done, info = env.step(action.tolist())
+                    obs, _reward, done, _info = env.step(action.tolist())
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -473,8 +478,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             # Save a replay video with probability plots
             save_rollout_video_with_probs(
-                replay_images, prob_data_list, total_episodes, success=done,
-                task_description=task_description, log_file=log_file
+                replay_images,
+                prob_data_list,
+                total_episodes,
+                success=done,
+                task_description=task_description,
+                log_file=log_file,
             )
 
             # Log current results

@@ -46,28 +46,26 @@ from typing import Optional
 
 import draccus
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
 import tqdm
 from accelerate import PartialState
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
-from transformers import AutoConfig, AutoImageProcessor
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -94,8 +92,6 @@ def create_gaussian_soft_target(
     if device is None:
         device = target_indices.device
 
-    N = target_indices.shape[0]
-
     # Create bin indices [0, 1, ..., num_classes-1]
     bin_indices = torch.arange(num_classes, device=device, dtype=torch.float32)  # [num_classes]
 
@@ -105,7 +101,7 @@ def create_gaussian_soft_target(
 
     # Compute Gaussian weights: exp(-0.5 * ((bin - target) / sigma)^2)
     distances = (bin_indices - target_indices) / sigma  # [N, num_classes]
-    soft_targets = torch.exp(-0.5 * distances ** 2)  # [N, num_classes]
+    soft_targets = torch.exp(-0.5 * distances**2)  # [N, num_classes]
 
     # Normalize to create probability distribution
     soft_targets = soft_targets / soft_targets.sum(dim=1, keepdim=True)
@@ -382,7 +378,9 @@ def compute_soft_target_action_loss(
     # Note: We use tokenizer's vocab_size, not logits_vocab_size (which may be padded)
     # Action tokens are at vocab_size - n_bins (bin 255) to vocab_size - 1 (bin 0)
     # We flip to get logits ordered by bin index: logit[0] = bin 0, logit[255] = bin 255
-    action_token_logits = action_logits[:, vocab_size - n_bins : vocab_size].flip(dims=[-1])  # [num_action_tokens, n_bins]
+    action_token_logits = action_logits[:, vocab_size - n_bins : vocab_size].flip(
+        dims=[-1]
+    )  # [num_action_tokens, n_bins]
 
     # Compute loss based on loss_type
     if loss_type == "hard_ce":
@@ -453,27 +451,20 @@ class FinetuneConfig:
                                                                     #   (If False, saves all checkpoints)
 
     # Loss Function Parameters
-    loss_type: str = "soft_ce"                                      # Loss function type: "hard_ce", "soft_ce", "wasserstein", "sinkhorn"
-                                                                    #   hard_ce: Standard cross-entropy (same as finetune.py)
-                                                                    #   soft_ce: Gaussian soft cross-entropy (default)
-                                                                    #   wasserstein: 1D Wasserstein distance (EMD)
-                                                                    #   sinkhorn: Sinkhorn distance (regularized OT)
+    # Options: "hard_ce", "soft_ce", "wasserstein", "sinkhorn"
+    loss_type: str = "soft_ce"
 
     # Soft Target Parameters (used by soft_ce, wasserstein, sinkhorn)
-    soft_target_sigma: float = 2.0                                  # Gaussian sigma for soft targets (in bin units)
-                                                                    #   Higher = softer targets, more tolerance for nearby bins
-                                                                    #   sigma=1.0 means ~68% weight within +/- 1 bin
-                                                                    #   sigma=2.0 means ~68% weight within +/- 2 bins
-                                                                    #   For wasserstein/sinkhorn: set to 0 for hard target
+    # sigma=1.0: ~68% weight within +/- 1 bin, sigma=2.0: +/- 2 bins
+    # For wasserstein/sinkhorn: set to 0 for hard target
+    soft_target_sigma: float = 2.0
 
     # Sinkhorn Parameters (only used when loss_type="sinkhorn")
-    sinkhorn_epsilon: float = 0.1                                   # Entropy regularization (smaller = closer to true Wasserstein)
-    sinkhorn_iters: int = 50                                        # Number of Sinkhorn iterations
+    sinkhorn_epsilon: float = 0.1  # Entropy regularization
+    sinkhorn_iters: int = 50
 
-    # Accuracy Margin Parameter
-    action_accuracy_margin: int = 0                                 # Margin for action accuracy calculation (in bins)
-                                                                    #   0 = strict exact match (default, same as original)
-                                                                    #   3 = predictions within +/- 3 bins are correct
+    # Accuracy Margin Parameter (0 = strict, 3 = +/- 3 bins tolerance)
+    action_accuracy_margin: int = 0
 
     # LoRA Arguments
     use_lora: bool = True                                           # Whether to use LoRA fine-tuning
@@ -655,7 +646,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
 
                 # Compute action loss (soft_ce, wasserstein, or sinkhorn)
-                loss, num_action_tokens = compute_soft_target_action_loss(
+                loss, _num_action_tokens = compute_soft_target_action_loss(
                     logits=output.logits,
                     labels=batch["labels"].to(device_id),
                     action_token_begin_idx=action_tokenizer.action_token_begin_idx,
@@ -675,7 +666,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalized_loss.backward()
 
             # Compute Accuracy and L1 Loss for Logging
-            action_logits = output.logits[:, num_image_patches : -1]
+            action_logits = output.logits[:, num_image_patches:-1]
             action_preds = action_logits.argmax(dim=2)
             action_gt = batch["labels"][:, 1:].to(action_preds.device)
             mask = action_gt > action_tokenizer.action_token_begin_idx
@@ -731,7 +722,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                 progress.update()
 
             # Save Model Checkpoint
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0 and gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
+            if (
+                (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+                and gradient_step_idx > 0
+                and gradient_step_idx % cfg.save_steps == 0
+            ):
                 if distributed_state.is_main_process:
                     print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 
